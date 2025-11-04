@@ -1,29 +1,32 @@
 name: WooCommerce → Supabase Sync
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *" # toutes les 30 minutes
-  workflow_dispatch: # permet de lancer manuellement depuis GitHub UI
+    - cron: '*/30 * * * *'  # every hour, optional
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v3
         with:
-          node-version: '20'
+          node-version: 20
+
+      - name: Install dependencies
+        run: |
+          npm install @supabase/supabase-js
 
       - name: Run sync script
+        run: node sync.js
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           WOOCOMMERCE_URL: ${{ secrets.WOOCOMMERCE_URL }}
-          WOOCOMMERCE_CONSUMER_KEY: ${{ secrets.WOOCOMMERCE_CONSUMER_KEY }}
-          WOOCOMMERCE_CONSUMER_SECRET: ${{ secrets.WOOCOMMERCE_CONSUMER_SECRET }}
-        run: |
-          node --version
-          node sync.js
+          WOOCOMMERCE_KEY: ${{ secrets.WOOCOMMERCE_KEY }}
+          WOOCOMMERCE_SECRET: ${{ secrets.WOOCOMMERCE_SECRET }}
