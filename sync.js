@@ -1,14 +1,6 @@
 /**
- * sync.js
- * WooCommerce → Supabase (Orders & Products)
- * Compatible avec les tables : `sales` et `products`
- * 
- * Nécessite les secrets :
- *  - SUPABASE_URL
- *  - SUPABASE_KEY (service_role)
- *  - WOOCOMMERCE_URL
- *  - WOOCOMMERCE_CONSUMER_KEY
- *  - WOOCOMMERCE_CONSUMER_SECRET
+ * sync.js - Optimized Version
+ * WooCommerce → Supabase (Orders & Top Products Only)
  */
 
 import fetch from "node-fetch";
@@ -76,27 +68,48 @@ async function main() {
   console.log("🚀 Starting WooCommerce → Supabase sync");
 
   const ordersBase = `${WOOCOMMERCE_URL}/wp-json/wc/v3/orders?consumer_key=${WC_KEY}&consumer_secret=${WC_SECRET}`;
-  const productsBase = `${WOOCOMMERCE_URL}/wp-json/wc/v3/products?consumer_key=${WC_KEY}&consumer_secret=${WC_SECRET}`;
 
-  // 1️⃣ Orders
+  // 1️⃣ Fetch all orders
   const allOrders = await fetchAllPages(ordersBase, "orders");
-  if (allOrders.length) {
-    const formatted = allOrders.map(formatOrder);
-    const { error } = await supabase.from("sales").upsert(formatted, { onConflict: "order_id" });
-    if (error) throw error;
-    console.log(`✅ Orders upserted: ${formatted.length}`);
-  } else console.log("⚠️ No orders found.");
+  if (!allOrders.length) {
+    console.log("⚠️ No orders found.");
+    return;
+  }
 
-  // 2️⃣ Products
-  const allProducts = await fetchAllPages(productsBase, "products");
-  if (allProducts.length) {
-    // 🧠 Optionnel : ne garder que les produits les plus vendus
-    const top = allProducts.filter((p) => parseInt(p.total_sales || 0) > 5); // ajustable
-    const formatted = top.map(formatProduct);
-    const { error } = await supabase.from("products").upsert(formatted, { onConflict: "product_id" });
-    if (error) throw error;
-    console.log(`✅ Products upserted: ${formatted.length}`);
-  } else console.log("⚠️ No products found.");
+  // Insert orders
+  const formattedOrders = allOrders.map(formatOrder);
+  const { error: orderError } = await supabase.from("sales").upsert(formattedOrders, { onConflict: "order_id" });
+  if (orderError) throw orderError;
+  console.log(`✅ Orders upserted: ${formattedOrders.length}`);
+
+  // 2️⃣ Extract unique product IDs from order line items
+  const productIds = [
+    ...new Set(allOrders.flatMap(o => (o.line_items || []).map(i => i.product_id)))
+  ];
+
+  console.log(`🧠 Found ${productIds.length} unique products in orders.`);
+
+  // 3️⃣ Fetch only these products
+  const topProducts = [];
+  for (const id of productIds) {
+    const url = `${WOOCOMMERCE_URL}/wp-json/wc/v3/products/${id}?consumer_key=${WC_KEY}&consumer_secret=${WC_SECRET}`;
+    const res = await fetch(url);
+    if (res.ok) {
+      const p = await res.json();
+      topProducts.push(p);
+      await sleep(300);
+    }
+  }
+
+  // 4️⃣ Upsert these products
+  if (topProducts.length) {
+    const formattedProducts = topProducts.map(formatProduct);
+    const { error: productError } = await supabase.from("products").upsert(formattedProducts, { onConflict: "product_id" });
+    if (productError) throw productError;
+    console.log(`✅ Products upserted: ${formattedProducts.length}`);
+  } else {
+    console.log("⚠️ No products linked to orders found.");
+  }
 
   console.log("🎉 Sync completed successfully!");
 }
