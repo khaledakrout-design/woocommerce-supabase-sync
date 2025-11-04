@@ -2,7 +2,7 @@ name: WooCommerce → Supabase Sync
 
 on:
   schedule:
- #   - cron: "*/30 * * * *" # toutes les 30 mn
+ #  - cron: "*/30 * * * *" # toutes les 30 mn
     - cron: "0 */6 * * *" # à la minute 0 toutes les 6 heures
   workflow_dispatch:
 
