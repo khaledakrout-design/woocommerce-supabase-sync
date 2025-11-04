@@ -1,161 +1,141 @@
-// On importe node-fetch comme demandé, bien que fetch soit natif dans Node 20.
-// Cela garantit la compatibilité et respecte la contrainte.
-import fetch from 'node-fetch';
+/**
+ * sync.js
+ * Script Node.js pour synchroniser WooCommerce -> Supabase via GitHub Actions (cron).
+ * Utilise la fetch API native (Node 18+ / Node 20).
+ *
+ * Exigences: configurer les secrets GitHub (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+ * WOOCOMMERCE_URL, WOOCOMMERCE_CONSUMER_KEY, WOOCOMMERCE_CONSUMER_SECRET).
+ */
 
-// --- Configuration et Secrets ---
-const {
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
-  WOOCOMMERCE_URL,
-  WOOCOMMERCE_CONSUMER_KEY,
-  WOOCOMMERCE_CONSUMER_SECRET
-} = process.env;
-
-// Constantes pour la pagination et la courtoisie API
 const PER_PAGE = 100;
-const DELAY_MS = 500; // 500ms de pause entre les appels API pour éviter le throttling
+const CHUNK_SIZE = 500; // taille d'upsert par chunk
 
-// --- Validation des secrets ---
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !WOOCOMMERCE_URL || !WOOCOMMERCE_CONSUMER_KEY || !WOOCOMMERCE_CONSUMER_SECRET) {
-  console.error("❌ Erreur critique : Une ou plusieurs variables d'environnement sont manquantes. Vérifiez les secrets GitHub.");
-  process.exit(1);
-}
+// small sleep helper
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// --- Fonctions Utilitaires ---
+const getEnvOrThrow = (name) => {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var ${name}`);
+  return v;
+};
 
-/**
- * Petite pause pour être respectueux envers l'API WooCommerce.
- * @param {number} ms - Durée de la pause en millisecondes.
- */
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-/**
- * Récupère les données paginées de l'API WooCommerce.
- * @param {string} endpoint - Le chemin de l'API (ex: '/products').
- * @param {number|null} recordLimit - Le nombre maximum d'enregistrements à récupérer (null pour tous).
- * @returns {Promise<Array<any>>} - Une liste de tous les enregistrements récupérés.
- */
-async function fetchWooCommerceData(endpoint, recordLimit = null) {
-  const allData = [];
+async function fetchAllPages(baseUrl, itemName = 'items') {
+  const all = [];
   let page = 1;
-  const entityName = endpoint.replace('/', '');
-
-  console.log(`🚀 Démarrage de la récupération pour : ${entityName}`);
-
   while (true) {
-    const url = `${WOOCOMMERCE_URL}/wp-json/wc/v3${endpoint}?per_page=${PER_PAGE}&page=${page}&consumer_key=${WOOCOMMERCE_CONSUMER_KEY}&consumer_secret=${WOOCOMMERCE_CONSUMER_SECRET}`;
-    
-    console.log(`- 📥 Fetching ${entityName}, page ${page}...`);
-    
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`Erreur API WooCommerce pour ${endpoint} (page ${page}): ${response.status} ${response.statusText}`);
+    const url = `${baseUrl}&page=${page}&per_page=${PER_PAGE}`;
+    console.log(`➡️ Fetching ${itemName} page ${page} -> ${url}`);
+    const res = await fetch(url, { timeout: 120000 });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status} when fetching ${itemName} page ${page} - ${txt}`);
     }
-    
-    const pageData = await response.json();
-
-    if (pageData.length === 0) {
-      console.log(`- ✅ Fin de la récupération pour ${entityName}. Aucune donnée sur la page ${page}.`);
-      break; // Sortie de la boucle, plus de données à récupérer
-    }
-    
-    console.log(`- 📦 Page ${page} → ${pageData.length} ${entityName} reçus.`);
-    allData.push(...pageData);
-
-    if (recordLimit && allData.length >= recordLimit) {
-        console.log(`- 🏁 Limite de ${recordLimit} enregistrements atteinte pour ${entityName}.`);
-        return allData.slice(0, recordLimit);
-    }
-    
+    const data = await res.json();
+    console.log(`📦 Page ${page} -> ${Array.isArray(data) ? data.length : 'N/A'} ${itemName}`);
+    if (!Array.isArray(data) || data.length === 0) break;
+    all.push(...data);
     page++;
-    await sleep(DELAY_MS);
+    // friendly pause to avoid throttling
+    await sleep(400);
   }
-  
-  return allData;
+  return all;
 }
 
-/**
- * Met à jour (upsert) les données dans une table Supabase via l'API REST.
- * @param {string} table - Le nom de la table Supabase.
- * @param {Array<any>} data - Les données à insérer/mettre à jour.
- */
-async function upsertSupabaseData(table, data) {
-    if (data.length === 0) {
-        console.log(`- 🤷 Aucune donnée à synchroniser pour la table "${table}".`);
-        return;
+async function upsertChunks(supabaseUrl, supabaseKey, table, records) {
+  if (!records || records.length === 0) {
+    console.log(`ℹ️ No records to upsert for ${table}`);
+    return;
+  }
+
+  for (let i = 0; i < records.length; i += CHUNK_SIZE) {
+    const chunk = records.slice(i, i + CHUNK_SIZE);
+    console.log(`🔀 Upserting chunk ${i / CHUNK_SIZE + 1} (${chunk.length}) into ${table}...`);
+    const res = await fetch(`${supabaseUrl}/rest/v1/${table}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+        Prefer: 'resolution=merge-duplicates' // upsert-like behaviour
+      },
+      body: JSON.stringify(chunk)
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Supabase upsert error for ${table}: ${res.status} ${body}`);
     }
-  console.log(`-  supabase 🔄 Synchronisation de ${data.length} enregistrements vers la table "${table}"...`);
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
-    method: 'POST',
-    headers: {
-      'apikey': SUPABASE_SERVICE_ROLE_KEY,
-      'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      'Prefer': 'resolution=merge-duplicates' // La magie de l'upsert
-    },
-    body: JSON.stringify(data)
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Erreur Supabase lors de l'upsert dans "${table}": ${response.status} ${response.statusText} - ${errorText}`);
+    console.log(`✅ Chunk upserted (${i + chunk.length}/${records.length})`);
+    await sleep(200); // small pause
   }
-  
-  console.log(`- supabase ✅ Succès : ${data.length} enregistrements synchronisés dans "${table}".`);
 }
 
-/**
- * Transforme un objet commande WooCommerce pour la table 'sales' de Supabase.
- */
-const formatOrder = (o) => ({
-  order_id: o.id.toString(),
-  created_at: o.date_created_gmt + "Z",
-  customer_name: `${o.billing.first_name || ""} ${o.billing.last_name || ""}`.trim() || 'Client inconnu',
-  total: parseFloat(o.total || "0"),
-  payment_method: o.payment_method_title || 'N/A',
-  status: o.status,
-});
+function formatOrderForSupabase(o) {
+  return {
+    order_id: String(o.id),
+    created_at: o.date_created_gmt ? o.date_created_gmt + 'Z' : new Date().toISOString(),
+    customer_name: `${(o.billing?.first_name || '')} ${(o.billing?.last_name || '')}`.trim() || 'Client inconnu',
+    total: parseFloat(o.total || '0') || 0,
+    payment_method: o.payment_method_title || 'N/A',
+    status: o.status || 'unknown'
+  };
+}
 
-/**
- * Transforme un objet produit WooCommerce pour la table 'products' de Supabase.
- */
-const formatProduct = (p) => ({
-  product_id: p.id.toString(),
-  name: p.name,
-  category: p.categories.length > 0 ? p.categories[0].name : "Non classé",
-  price: parseFloat(p.price || "0"),
-  stock: p.stock_quantity ?? 0,
-  total_sales: p.total_sales,
-});
+function formatProductForSupabase(p) {
+  return {
+    product_id: String(p.id),
+    name: p.name || 'N/A',
+    category: Array.isArray(p.categories) && p.categories.length > 0 ? p.categories[0].name : 'Non classé',
+    price: parseFloat(p.price || '0') || 0,
+    stock: p.stock_quantity ?? 0,
+    total_sales: p.total_sales ?? 0
+  };
+}
 
-// --- Script Principal ---
 async function main() {
-  console.log("--- ✨ Démarrage de la synchronisation WooCommerce -> Supabase ---");
-  const startTime = Date.now();
-  
   try {
-    // 1. Synchronisation des 500 dernières commandes
-    const rawOrders = await fetchWooCommerceData('/orders', 500);
-    const allowedStatuses = ['completed', 'processing', 'refunded'];
-    const formattedOrders = rawOrders
-        .filter(o => allowedStatuses.includes(o.status))
-        .map(formatOrder);
-    await upsertSupabaseData('sales', formattedOrders);
-    
-    // 2. Synchronisation de TOUS les produits
-    const rawProducts = await fetchWooCommerceData('/products');
-    const formattedProducts = rawProducts.map(formatProduct);
-    await upsertSupabaseData('products', formattedProducts);
+    const SUPABASE_URL = getEnvOrThrow('SUPABASE_URL').replace(/\/$/, '');
+    const SUPABASE_KEY = getEnvOrThrow('SUPABASE_SERVICE_ROLE_KEY');
+    const WOOCOMMERCE_URL = getEnvOrThrow('WOOCOMMERCE_URL').replace(/\/$/, '');
+    const WC_KEY = getEnvOrThrow('WOOCOMMERCE_CONSUMER_KEY');
+    const WC_SECRET = getEnvOrThrow('WOOCOMMERCE_CONSUMER_SECRET');
 
-    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-    console.log(`\n--- ✅ Synchronisation complète terminée en ${duration}s ---`);
-    console.log(`- Commandes traitées : ${formattedOrders.length}`);
-    console.log(`- Produits traités : ${formattedProducts.length}`);
-    
-  } catch (error) {
-    console.error("\n--- ❌ ERREUR FATALE PENDANT LA SYNCHRONISATION ---");
-    console.error(error);
-    process.exit(1); // Très important pour que GitHub Action signale un échec
+    console.log('🚀 Starting WooCommerce -> Supabase sync');
+    const ordersBase = `${WOOCOMMERCE_URL}/wp-json/wc/v3/orders?consumer_key=${encodeURIComponent(WC_KEY)}&consumer_secret=${encodeURIComponent(WC_SECRET)}`;
+    const productsBase = `${WOOCOMMERCE_URL}/wp-json/wc/v3/products?consumer_key=${encodeURIComponent(WC_KEY)}&consumer_secret=${encodeURIComponent(WC_SECRET)}`;
+
+    // Fetch orders (paginated)
+    console.log('🔎 Fetching orders (paginated)');
+    const allOrders = await fetchAllPages(ordersBase, 'orders');
+    console.log(`📦 Total orders fetched: ${allOrders.length}`);
+
+    // Format & upsert orders in chunks
+    const formattedOrders = allOrders.map(formatOrderForSupabase);
+    if (formattedOrders.length > 0) {
+      await upsertChunks(SUPABASE_URL, SUPABASE_KEY, 'sales', formattedOrders);
+      console.log(`✅ Orders upsert completed (${formattedOrders.length})`);
+    } else {
+      console.log('⚠️ No orders to upsert');
+    }
+
+    // Fetch products (paginated)
+    console.log('🔎 Fetching products (paginated)');
+    const allProducts = await fetchAllPages(productsBase, 'products');
+    console.log(`🛍️ Total products fetched: ${allProducts.length}`);
+
+    // Format & upsert products
+    const formattedProducts = allProducts.map(formatProductForSupabase);
+    if (formattedProducts.length > 0) {
+      await upsertChunks(SUPABASE_URL, SUPABASE_KEY, 'products', formattedProducts);
+      console.log(`✅ Products upsert completed (${formattedProducts.length})`);
+    } else {
+      console.log('⚠️ No products to upsert');
+    }
+
+    console.log(`🎉 Synchronization finished: ${formattedOrders.length} orders, ${formattedProducts.length} products.`);
+    process.exit(0);
+  } catch (err) {
+    console.error('❌ Sync failed:', err.message || err);
+    process.exit(1);
   }
 }
 
