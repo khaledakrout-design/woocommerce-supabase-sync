@@ -1,16 +1,10 @@
 /**
- * sync.js
- * Script Node.js pour synchroniser WooCommerce -> Supabase via GitHub Actions (cron).
- * Utilise la fetch API native (Node 18+ / Node 20).
- *
- * Exigences: configurer les secrets GitHub (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
- * WOOCOMMERCE_URL, WOOCOMMERCE_CONSUMER_KEY, WOOCOMMERCE_CONSUMER_SECRET).
+ * sync.js — WooCommerce Orders -> Supabase (BI Perfume-Me)
+ * Synchronisation centrée sur les commandes + top produits vendus
  */
 
 const PER_PAGE = 100;
-const CHUNK_SIZE = 500; // taille d'upsert par chunk
-
-// small sleep helper
+const CHUNK_SIZE = 500;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const getEnvOrThrow = (name) => {
@@ -24,48 +18,41 @@ async function fetchAllPages(baseUrl, itemName = 'items') {
   let page = 1;
   while (true) {
     const url = `${baseUrl}&page=${page}&per_page=${PER_PAGE}`;
-    console.log(`➡️ Fetching ${itemName} page ${page} -> ${url}`);
+    console.log(`➡️ Fetching ${itemName} page ${page}`);
     const res = await fetch(url, { timeout: 120000 });
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
       throw new Error(`HTTP ${res.status} when fetching ${itemName} page ${page} - ${txt}`);
     }
     const data = await res.json();
-    console.log(`📦 Page ${page} -> ${Array.isArray(data) ? data.length : 'N/A'} ${itemName}`);
     if (!Array.isArray(data) || data.length === 0) break;
     all.push(...data);
     page++;
-    // friendly pause to avoid throttling
-    await sleep(400);
+    await sleep(300);
   }
   return all;
 }
 
 async function upsertChunks(supabaseUrl, supabaseKey, table, records) {
-  if (!records || records.length === 0) {
-    console.log(`ℹ️ No records to upsert for ${table}`);
-    return;
-  }
-
+  if (!records?.length) return console.log(`ℹ️ No records to upsert for ${table}`);
   for (let i = 0; i < records.length; i += CHUNK_SIZE) {
     const chunk = records.slice(i, i + CHUNK_SIZE);
-    console.log(`🔀 Upserting chunk ${i / CHUNK_SIZE + 1} (${chunk.length}) into ${table}...`);
     const res = await fetch(`${supabaseUrl}/rest/v1/${table}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         apikey: supabaseKey,
         Authorization: `Bearer ${supabaseKey}`,
-        Prefer: 'resolution=merge-duplicates' // upsert-like behaviour
+        Prefer: 'resolution=merge-duplicates',
       },
-      body: JSON.stringify(chunk)
+      body: JSON.stringify(chunk),
     });
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Supabase upsert error for ${table}: ${res.status} ${body}`);
     }
-    console.log(`✅ Chunk upserted (${i + chunk.length}/${records.length})`);
-    await sleep(200); // small pause
+    console.log(`✅ Upserted ${chunk.length} records into ${table}`);
+    await sleep(200);
   }
 }
 
@@ -76,18 +63,7 @@ function formatOrderForSupabase(o) {
     customer_name: `${(o.billing?.first_name || '')} ${(o.billing?.last_name || '')}`.trim() || 'Client inconnu',
     total: parseFloat(o.total || '0') || 0,
     payment_method: o.payment_method_title || 'N/A',
-    status: o.status || 'unknown'
-  };
-}
-
-function formatProductForSupabase(p) {
-  return {
-    product_id: String(p.id),
-    name: p.name || 'N/A',
-    category: Array.isArray(p.categories) && p.categories.length > 0 ? p.categories[0].name : 'Non classé',
-    price: parseFloat(p.price || '0') || 0,
-    stock: p.stock_quantity ?? 0,
-    total_sales: p.total_sales ?? 0
+    status: o.status || 'unknown',
   };
 }
 
@@ -100,38 +76,48 @@ async function main() {
     const WC_SECRET = getEnvOrThrow('WOOCOMMERCE_CONSUMER_SECRET');
 
     console.log('🚀 Starting WooCommerce -> Supabase sync');
-    const ordersBase = `${WOOCOMMERCE_URL}/wp-json/wc/v3/orders?consumer_key=${encodeURIComponent(WC_KEY)}&consumer_secret=${encodeURIComponent(WC_SECRET)}`;
-    const productsBase = `${WOOCOMMERCE_URL}/wp-json/wc/v3/products?consumer_key=${encodeURIComponent(WC_KEY)}&consumer_secret=${encodeURIComponent(WC_SECRET)}`;
 
-    // Fetch orders (paginated)
-    console.log('🔎 Fetching orders (paginated)');
+    const ordersBase = `${WOOCOMMERCE_URL}/wp-json/wc/v3/orders?consumer_key=${encodeURIComponent(WC_KEY)}&consumer_secret=${encodeURIComponent(WC_SECRET)}`;
+
+    // 1️⃣ Fetch orders
     const allOrders = await fetchAllPages(ordersBase, 'orders');
     console.log(`📦 Total orders fetched: ${allOrders.length}`);
 
-    // Format & upsert orders in chunks
+    // 2️⃣ Format and upsert orders
     const formattedOrders = allOrders.map(formatOrderForSupabase);
-    if (formattedOrders.length > 0) {
-      await upsertChunks(SUPABASE_URL, SUPABASE_KEY, 'sales', formattedOrders);
-      console.log(`✅ Orders upsert completed (${formattedOrders.length})`);
-    } else {
-      console.log('⚠️ No orders to upsert');
+    await upsertChunks(SUPABASE_URL, SUPABASE_KEY, 'sales', formattedOrders);
+
+    // 3️⃣ Extract and aggregate top-selling products from order items
+    const productStats = {};
+
+    for (const order of allOrders) {
+      if (!Array.isArray(order.line_items)) continue;
+      for (const item of order.line_items) {
+        const pid = String(item.product_id);
+        if (!productStats[pid]) {
+          productStats[pid] = {
+            product_id: pid,
+            name: item.name || 'Produit inconnu',
+            total_sold: 0,
+            total_revenue: 0,
+            last_sold_date: order.date_created_gmt ? order.date_created_gmt + 'Z' : new Date().toISOString(),
+          };
+        }
+        productStats[pid].total_sold += item.quantity || 0;
+        productStats[pid].total_revenue += parseFloat(item.total || '0') || 0;
+      }
     }
 
-    // Fetch products (paginated)
-    console.log('🔎 Fetching products (paginated)');
-    const allProducts = await fetchAllPages(productsBase, 'products');
-    console.log(`🛍️ Total products fetched: ${allProducts.length}`);
+    // 4️⃣ Convert object to array and keep only top X products (e.g., 50)
+    const topProducts = Object.values(productStats)
+      .sort((a, b) => b.total_sold - a.total_sold)
+      .slice(0, 50);
 
-    // Format & upsert products
-    const formattedProducts = allProducts.map(formatProductForSupabase);
-    if (formattedProducts.length > 0) {
-      await upsertChunks(SUPABASE_URL, SUPABASE_KEY, 'products', formattedProducts);
-      console.log(`✅ Products upsert completed (${formattedProducts.length})`);
-    } else {
-      console.log('⚠️ No products to upsert');
-    }
+    // 5️⃣ Upsert top products into Supabase
+    await upsertChunks(SUPABASE_URL, SUPABASE_KEY, 'products', topProducts);
 
-    console.log(`🎉 Synchronization finished: ${formattedOrders.length} orders, ${formattedProducts.length} products.`);
+    console.log(`🎯 Top ${topProducts.length} products synced successfully.`);
+    console.log(`🎉 Synchronization finished: ${formattedOrders.length} orders processed.`);
     process.exit(0);
   } catch (err) {
     console.error('❌ Sync failed:', err.message || err);
