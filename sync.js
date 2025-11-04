@@ -1,12 +1,14 @@
 /**
- * sync.js - Optimized Version
- * WooCommerce → Supabase (Orders & Top Products Only)
+ * sync.js
+ * WooCommerce → Supabase (Orders & Products Optimized)
+ * Compatible avec les tables : `sales` et `products`
  */
 
 import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 
 const PER_PAGE = 100;
+const PRODUCT_BATCH_SIZE = 100;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const getEnv = (name) => {
@@ -35,7 +37,7 @@ async function fetchAllPages(baseUrl, itemName = "items") {
     if (!Array.isArray(data) || data.length === 0) break;
     all.push(...data);
     page++;
-    await sleep(500);
+    await sleep(300);
   }
   console.log(`📦 Total ${itemName} fetched: ${all.length}`);
   return all;
@@ -60,8 +62,28 @@ function formatProduct(p) {
     category: Array.isArray(p.categories) && p.categories.length > 0 ? p.categories[0].name : "Non classé",
     price: parseFloat(p.price || "0") || 0,
     stock: p.stock_quantity ?? 0,
-    total_sales: parseFloat(p.total_sales || "0") || 0
+    total_sales: parseFloat(p.total_sales || "0") || 0,
   };
+}
+
+// Fetch products by batches of 100 max
+async function fetchProductsByBatches(productIds) {
+  const allProducts = [];
+  for (let i = 0; i < productIds.length; i += PRODUCT_BATCH_SIZE) {
+    const batch = productIds.slice(i, i + PRODUCT_BATCH_SIZE);
+    const url = `${WOOCOMMERCE_URL}/wp-json/wc/v3/products?include=${batch.join(",")}&consumer_key=${WC_KEY}&consumer_secret=${WC_SECRET}`;
+    console.log(`➡️ Fetching products batch ${i / PRODUCT_BATCH_SIZE + 1}`);
+    const res = await fetch(url);
+    if (res.ok) {
+      const data = await res.json();
+      allProducts.push(...data);
+    } else {
+      console.warn(`⚠️ Failed to fetch product batch starting at index ${i}`);
+    }
+    await sleep(300);
+  }
+  console.log(`📦 Total product details fetched: ${allProducts.length}`);
+  return allProducts;
 }
 
 async function main() {
@@ -69,46 +91,36 @@ async function main() {
 
   const ordersBase = `${WOOCOMMERCE_URL}/wp-json/wc/v3/orders?consumer_key=${WC_KEY}&consumer_secret=${WC_SECRET}`;
 
-  // 1️⃣ Fetch all orders
+  // 1️⃣ Fetch and upsert orders
   const allOrders = await fetchAllPages(ordersBase, "orders");
-  if (!allOrders.length) {
+  if (allOrders.length) {
+    const formattedOrders = allOrders.map(formatOrder);
+    const { error } = await supabase.from("sales").upsert(formattedOrders, { onConflict: "order_id" });
+    if (error) throw error;
+    console.log(`✅ Orders upserted: ${formattedOrders.length}`);
+  } else {
     console.log("⚠️ No orders found.");
     return;
   }
 
-  // Insert orders
-  const formattedOrders = allOrders.map(formatOrder);
-  const { error: orderError } = await supabase.from("sales").upsert(formattedOrders, { onConflict: "order_id" });
-  if (orderError) throw orderError;
-  console.log(`✅ Orders upserted: ${formattedOrders.length}`);
-
-  // 2️⃣ Extract unique product IDs from order line items
+  // 2️⃣ Extract unique product IDs from orders
   const productIds = [
-    ...new Set(allOrders.flatMap(o => (o.line_items || []).map(i => i.product_id)))
-  ];
+    ...new Set(
+      allOrders.flatMap((order) => (order.line_items || []).map((item) => item.product_id))
+    ),
+  ].filter(Boolean);
 
   console.log(`🧠 Found ${productIds.length} unique products in orders.`);
 
-  // 3️⃣ Fetch only these products
-  const topProducts = [];
-  for (const id of productIds) {
-    const url = `${WOOCOMMERCE_URL}/wp-json/wc/v3/products/${id}?consumer_key=${WC_KEY}&consumer_secret=${WC_SECRET}`;
-    const res = await fetch(url);
-    if (res.ok) {
-      const p = await res.json();
-      topProducts.push(p);
-      await sleep(300);
-    }
-  }
-
-  // 4️⃣ Upsert these products
-  if (topProducts.length) {
-    const formattedProducts = topProducts.map(formatProduct);
-    const { error: productError } = await supabase.from("products").upsert(formattedProducts, { onConflict: "product_id" });
-    if (productError) throw productError;
+  // 3️⃣ Fetch product details by batches and upsert
+  if (productIds.length > 0) {
+    const allProducts = await fetchProductsByBatches(productIds);
+    const formattedProducts = allProducts.map(formatProduct);
+    const { error } = await supabase.from("products").upsert(formattedProducts, { onConflict: "product_id" });
+    if (error) throw error;
     console.log(`✅ Products upserted: ${formattedProducts.length}`);
   } else {
-    console.log("⚠️ No products linked to orders found.");
+    console.log("⚠️ No products found in orders.");
   }
 
   console.log("🎉 Sync completed successfully!");
